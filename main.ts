@@ -490,6 +490,84 @@ function applyHunks(before: string, hunks: Hunk[], strict: boolean, failPath: st
   return joinFile(f);
 }
 
+/** SPEC.md section 7: SEARCH/REPLACE blocks. */
+function parseSR(lines: string[], strict: boolean): Edit[] {
+  interface Block {
+    path: string;
+    oldLines: string[];
+    newLines: string[];
+  }
+  const blocks: Block[] = [];
+  let prevEnd = 0;
+  let prevPath: string | null = null;
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i]!.trimEnd() !== '<<<<<<< SEARCH') {
+      i += 1;
+      continue;
+    }
+    const searchLine = i;
+    let path: string | null = null;
+    for (let j = searchLine - 1; j >= prevEnd; j--) {
+      const t = lines[j]!;
+      if (blank(t)) continue;
+      if (t.trim().startsWith('```')) continue;
+      path = t.trim();
+      break;
+    }
+    if (path === null) path = prevPath;
+    if (path === null) throw new Exit2(`error: parse ${searchLine + 1}`);
+    let eq = -1;
+    let end = -1;
+    for (let j = searchLine + 1; j < lines.length; j++) {
+      const t = lines[j]!.trimEnd();
+      if (t === '=======') {
+        eq = j;
+        break;
+      }
+      if (t === '>>>>>>> REPLACE') break;
+    }
+    if (eq >= 0) {
+      for (let j = eq + 1; j < lines.length; j++) {
+        if (lines[j]!.trimEnd() === '>>>>>>> REPLACE') {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (eq < 0 || end < 0) throw new Exit2(`error: parse ${searchLine + 1}`);
+    blocks.push({ path, oldLines: lines.slice(searchLine + 1, eq), newLines: lines.slice(eq + 1, end) });
+    prevPath = path;
+    prevEnd = end + 1;
+    i = end + 1;
+  }
+  if (blocks.length === 0) throw new Exit2('error: parse 1');
+  return blocks.map((b) => {
+    const path = b.path;
+    const oldLines = b.oldLines;
+    const newLines = b.newLines;
+    return (tree: Tree): void => {
+      if (!safe(path)) throw new Fail('unsafe', path);
+      if (oldLines.length === 0) {
+        if (tree.get(path) !== null) throw new Fail('exists', path);
+        tree.now.set(path, newLines.length === 0 ? '' : newLines.join('\n') + '\n');
+        return;
+      }
+      const before = tree.get(path);
+      if (before === null) throw new Fail('missing', path);
+      const f = splitFile(before);
+      const tier = findTier(oldLines, f.lines, 0, strict);
+      if (tier < 0) throw new Fail('no-match', path);
+      const occs = occurrences(oldLines, f.lines, tier, 0);
+      if (occs.length > 1) throw new Fail('ambiguous', path);
+      const pos = occs[0]!;
+      const repl = buildN(newLines, newLines.map(() => -1), oldLines, f.lines, pos, tier);
+      f.lines.splice(pos, oldLines.length, ...repl);
+      tree.now.set(path, joinFile(f));
+    };
+  });
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -521,6 +599,7 @@ function run(args: string[]): { code: number; out: string[] } {
   try {
     if (kind === 'json') edits = jsonEdits(text, lines);
     else if (kind === 'unified') edits = parseUnified(lines, strict, moves);
+    else if (kind === 'search-replace') edits = parseSR(lines, strict);
     else edits = [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
