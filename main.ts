@@ -412,7 +412,6 @@ function parseUnified(lines: string[], strict: boolean, moves: [string, string][
     const create = oldPath === null || r.create;
     const del = newPath === null || r.del;
     const isMove = !create && !del && oldPath !== null && newPath !== null && oldPath !== newPath;
-    const target = isMove ? newPath! : create ? newPath! : oldPath!;
     const failPath = isMove || !create ? oldPath! : newPath!;
     return (tree: Tree): void => {
       if (oldPath !== null && !safe(oldPath)) throw new Fail('unsafe', oldPath);
