@@ -40,6 +40,129 @@ function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
+/** SPEC.md section 3: a file's lines, its line break and whether it ends with one. */
+interface FileLines {
+  lines: string[];
+  br: string;
+  eol: boolean;
+}
+
+function splitFile(text: string): FileLines {
+  if (text === '') return { lines: [], br: '\n', eol: false };
+  const nl = text.indexOf('\n');
+  const br = nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+  const parts = text.split(br);
+  const eol = text.endsWith(br);
+  if (eol) parts.pop();
+  return { lines: parts, br, eol };
+}
+
+function joinFile(f: FileLines): string {
+  if (f.lines.length === 0) return '';
+  return f.lines.join(f.br) + (f.eol ? f.br : '');
+}
+
+/** SPEC.md section 5: line matching at three tiers. */
+function lineAtTier(s: string, tier: number): string {
+  if (tier === 0) return s;
+  if (tier === 1) return s.replace(/[ \t]+$/, '');
+  return s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+}
+
+function lineEq(a: string, b: string, tier: number): boolean {
+  return lineAtTier(a, tier) === lineAtTier(b, tier);
+}
+
+function occurrences(O: string[], lines: string[], tier: number, from: number): number[] {
+  const out: number[] = [];
+  if (O.length === 0) return out;
+  for (let i = from; i + O.length <= lines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < O.length; j++) {
+      if (!lineEq(O[j]!, lines[i + j]!, tier)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+/** First tier (0..2, or 0 only when strict) at which O occurs at/after `from`, else -1. */
+function findTier(O: string[], lines: string[], from: number, strict: boolean): number {
+  const max = strict ? 0 : 2;
+  for (let t = 0; t <= max; t++) {
+    if (occurrences(O, lines, t, from).length > 0) return t;
+  }
+  return -1;
+}
+
+function leadingWs(s: string): string {
+  const m = /^[ \t]*/.exec(s);
+  return m ? m[0] : '';
+}
+
+/**
+ * Build the replacement lines N for a match of O at position `pos` in the file's lines.
+ * ctx[i] is the index in O of the context line N[i] corresponds to, or -1 for a new line.
+ * Context lines are written as the file's own matched line; at tier 2 every other line of N
+ * is re-indented from O's first line's indent P to the file's first matched line's indent F.
+ */
+function buildN(N: string[], ctx: number[], O: string[], fileLines: string[], pos: number, tier: number): string[] {
+  const out: string[] = [];
+  for (let j = 0; j < N.length; j++) {
+    const cj = ctx[j]!;
+    if (cj >= 0) {
+      out.push(fileLines[pos + cj]!);
+      continue;
+    }
+    let s = N[j]!;
+    if (tier === 2 && O.length > 0) {
+      const P = leadingWs(O[0]!);
+      const F = leadingWs(fileLines[pos]!);
+      if (s !== '' && s.trim() !== '' && s.startsWith(P)) s = F + s.slice(P.length);
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+/** One body line of a unified hunk or a V4A chunk: kind ` ` context, `-` old, `+` new, `\` marker. */
+interface BodyLine {
+  k: ' ' | '-' | '+' | '\\';
+  text: string;
+}
+
+function bodyON(body: BodyLine[]): { O: string[]; N: string[]; ctx: number[] } {
+  const O: string[] = [];
+  const N: string[] = [];
+  const ctx: number[] = [];
+  for (const b of body) {
+    if (b.k === ' ') {
+      ctx.push(O.length);
+      O.push(b.text);
+      N.push(b.text);
+    } else if (b.k === '-') {
+      O.push(b.text);
+    } else if (b.k === '+') {
+      ctx.push(-1);
+      N.push(b.text);
+    }
+  }
+  return { O, N, ctx };
+}
+
+/** True when a `\` line follows the hunk/chunk's last context or `+` body line. */
+function hasNoEol(body: BodyLine[]): boolean {
+  let last = -1;
+  for (let i = 0; i < body.length; i++) {
+    if (body[i]!.k === ' ' || body[i]!.k === '+') last = i;
+  }
+  if (last < 0) return false;
+  return body[last + 1] !== undefined && body[last + 1]!.k === '\\';
+}
+
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   private readonly orig = new Map<string, string | null>();
@@ -164,6 +287,209 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   return edits;
 }
 
+/** SPEC.md section 6: unified diffs. */
+interface Hunk {
+  a: number;
+  body: BodyLine[];
+}
+
+interface UniSection {
+  oldPath: string | null;
+  newPath: string | null;
+  create: boolean;
+  del: boolean;
+  hunks: Hunk[];
+}
+
+function uniPath(text: string): string {
+  return text.split('\t')[0]!.trim();
+}
+
+function stripAB(p: string): string {
+  return p.startsWith('a/') || p.startsWith('b/') ? p.slice(2) : p;
+}
+
+function parseUnified(lines: string[], strict: boolean, moves: [string, string][]): Edit[] {
+  interface RawSection {
+    mmOld: string | null;
+    mmNew: string | null;
+    rnOld: string | null;
+    rnNew: string | null;
+    dgOld: string | null;
+    dgNew: string | null;
+    create: boolean;
+    del: boolean;
+    hunks: Hunk[];
+  }
+  const raw: RawSection[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const l = lines[i]!;
+    if (l.startsWith('@@')) throw new Exit2(`error: parse ${i + 1}`);
+    let sec: RawSection | null = null;
+    if (l.startsWith('diff --git ')) {
+      const m = /^diff --git a\/([^ ]+) b\/([^ ]+)$/.exec(l);
+      if (!m) throw new Exit2(`error: parse ${i + 1}`);
+      sec = { mmOld: null, mmNew: null, rnOld: null, rnNew: null, dgOld: m[1]!, dgNew: m[2]!, create: false, del: false, hunks: [] };
+      i += 1;
+    } else if (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) {
+      sec = { mmOld: null, mmNew: null, rnOld: null, rnNew: null, dgOld: null, dgNew: null, create: false, del: false, hunks: [] };
+    } else {
+      i += 1;
+      continue;
+    }
+    raw.push(sec);
+    let inHeader = true;
+    while (i < lines.length) {
+      const s = lines[i]!;
+      if (s.startsWith('diff --git ')) break;
+      if (!inHeader && s.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
+      if (s.startsWith('@@')) {
+        const hm = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(s);
+        if (!hm) throw new Exit2(`error: parse ${i + 1}`);
+        inHeader = false;
+        const hunk: Hunk = { a: parseInt(hm[1]!, 10), body: [] };
+        i += 1;
+        while (i < lines.length) {
+          const b = lines[i]!;
+          if (b.startsWith('diff --git ')) break;
+          if (b.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
+          if (b === '' || b[0] === ' ' || b[0] === '-' || b[0] === '+' || b[0] === '\\') {
+            hunk.body.push({ k: b === '' ? ' ' : (b[0] as BodyLine['k']), text: b === '' ? '' : b.slice(1) });
+            i += 1;
+          } else break;
+        }
+        while (hunk.body.length > 0) {
+          const lastB = hunk.body[hunk.body.length - 1]!;
+          if (lastB.k === ' ' && lastB.text === '') hunk.body.pop();
+          else break;
+        }
+        sec.hunks.push(hunk);
+        continue;
+      }
+      if (inHeader) {
+        if (s.startsWith('--- ')) {
+          if (!(lines[i + 1] ?? '').startsWith('+++ ')) throw new Exit2(`error: parse ${i + 2}`);
+          sec.mmOld = uniPath(s.slice(4));
+          sec.mmNew = uniPath(lines[i + 1]!.slice(4));
+          i += 2;
+          continue;
+        }
+        if (s.startsWith('rename from ')) {
+          sec.rnOld = s.slice(12).trim();
+          i += 1;
+          continue;
+        }
+        if (s.startsWith('rename to ')) {
+          sec.rnNew = s.slice(10).trim();
+          i += 1;
+          continue;
+        }
+        if (s.startsWith('new file mode')) {
+          sec.create = true;
+          i += 1;
+          continue;
+        }
+        if (s.startsWith('deleted file mode')) {
+          sec.del = true;
+          i += 1;
+          continue;
+        }
+      }
+      i += 1;
+    }
+  }
+  if (raw.length === 0) throw new Exit2('error: parse 1');
+  return raw.map((r) => {
+    const pick = (mm: string | null, rn: string | null, dg: string | null): string | null => {
+      if (mm !== null) return mm === '/dev/null' ? null : stripAB(mm);
+      if (rn !== null) return rn === '/dev/null' ? null : stripAB(rn);
+      if (dg !== null) return dg === '/dev/null' ? null : stripAB(dg);
+      return null;
+    };
+    const oldPath = pick(r.mmOld, r.rnOld, r.dgOld);
+    const newPath = pick(r.mmNew, r.rnNew, r.dgNew);
+    const create = oldPath === null || r.create;
+    const del = newPath === null || r.del;
+    const isMove = !create && !del && oldPath !== null && newPath !== null && oldPath !== newPath;
+    const target = isMove ? newPath! : create ? newPath! : oldPath!;
+    const failPath = isMove || !create ? oldPath! : newPath!;
+    return (tree: Tree): void => {
+      if (oldPath !== null && !safe(oldPath)) throw new Fail('unsafe', oldPath);
+      if (newPath !== null && !safe(newPath)) throw new Fail('unsafe', newPath);
+      if (create) {
+        if (tree.get(newPath!) !== null) throw new Fail('exists', newPath!);
+        const out: string[] = [];
+        let eol = true;
+        for (const h of r.hunks) {
+          for (const b of h.body) if (b.k === '+') out.push(b.text);
+        }
+        for (let hi = r.hunks.length - 1; hi >= 0; hi--) {
+          const h = r.hunks[hi]!;
+          if (h.body.some((b) => b.k === '+')) {
+            eol = !hasNoEol(h.body);
+            break;
+          }
+        }
+        tree.now.set(newPath!, out.length === 0 ? '' : out.join('\n') + (eol ? '\n' : ''));
+        return;
+      }
+      if (del) {
+        if (tree.get(oldPath!) === null) throw new Fail('missing', oldPath!);
+        tree.now.set(oldPath!, null);
+        return;
+      }
+      const before = tree.get(oldPath!);
+      if (before === null) throw new Fail('missing', oldPath!);
+      if (isMove && tree.get(newPath!) !== null) throw new Fail('exists', newPath!);
+      const after = applyHunks(before, r.hunks, strict, failPath);
+      if (isMove) {
+        tree.now.set(newPath!, after);
+        tree.now.set(oldPath!, null);
+        moves.push([oldPath!, newPath!]);
+      } else {
+        tree.now.set(oldPath!, after);
+      }
+    };
+  });
+}
+
+/** Apply a section's hunks in order to a file's text (SPEC.md section 6). */
+function applyHunks(before: string, hunks: Hunk[], strict: boolean, failPath: string): string {
+  const f = splitFile(before);
+  let d = 0;
+  for (const hunk of hunks) {
+    const { O, N, ctx } = bodyON(hunk.body);
+    if (O.length === 0) {
+      const at = Math.min(hunk.a + d, f.lines.length);
+      const atEnd = at === f.lines.length;
+      f.lines.splice(at, 0, ...N);
+      if (atEnd) f.eol = !hasNoEol(hunk.body);
+      d += N.length;
+      continue;
+    }
+    const tier = findTier(O, f.lines, 0, strict);
+    if (tier < 0) throw new Fail('no-match', failPath);
+    const occs = occurrences(O, f.lines, tier, 0);
+    const target = hunk.a - 1 + d;
+    let best = occs[0]!;
+    let bestDist = Math.abs(best - target);
+    for (const pos of occs) {
+      const dist = Math.abs(pos - target);
+      if (dist < bestDist) {
+        best = pos;
+        bestDist = dist;
+      }
+    }
+    const atEnd = best + O.length === f.lines.length;
+    const repl = buildN(N, ctx, O, f.lines, best, tier);
+    f.lines.splice(best, O.length, ...repl);
+    if (atEnd) f.eol = !hasNoEol(hunk.body);
+    d += N.length - O.length;
+  }
+  return joinFile(f);
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -190,9 +516,12 @@ function run(args: string[]): { code: number; out: string[] } {
   const lines = patchLines(text);
   const kind = format === null || format === 'auto' ? detect(lines) : format;
   if (kind === null) return { code: 2, out: ['error: format'] };
+  const moves: [string, string][] = [];
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : [];
+    if (kind === 'json') edits = jsonEdits(text, lines);
+    else if (kind === 'unified') edits = parseUnified(lines, strict, moves);
+    else edits = [];
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
@@ -212,20 +541,42 @@ function run(args: string[]): { code: number; out: string[] } {
     }
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
-  const rows: string[] = [];
-  for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+  const byteCmp = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
+  const rows: { key: string; text: string }[] = [];
+  const usedOld = new Set<string>();
+  const usedNew = new Set<string>();
+  for (const [oldP, newP] of moves) {
+    const wasOld = tree.original(oldP);
+    const nowOld = tree.now.get(oldP);
+    const wasNew = tree.original(newP);
+    const nowNew = tree.now.get(newP);
+    if (wasOld !== null && nowOld === null && wasNew === null && nowNew !== null) {
+      rows.push({ key: newP, text: `R ${oldP} -> ${newP}` });
+      usedOld.add(oldP);
+      usedNew.add(newP);
+    }
+  }
+  for (const p of [...tree.now.keys()].sort(byteCmp)) {
+    if (usedOld.has(p) || usedNew.has(p)) continue;
     const was = tree.original(p);
     const now = tree.now.get(p)!;
     if (was === now) continue;
-    rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
-    if (check) continue;
-    if (now === null) rmSync(p, { force: true });
-    else {
-      mkdirSync(dirname(p), { recursive: true });
-      writeFileSync(p, now);
+    rows.push({ key: p, text: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
+  }
+  rows.sort((a, b) => byteCmp(a.key, b.key));
+  if (!check) {
+    for (const p of [...tree.now.keys()].sort(byteCmp)) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (was === now) continue;
+      if (now === null) rmSync(p, { force: true });
+      else {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, now);
+      }
     }
   }
-  return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
+  return { code: 0, out: [...rows.map((r) => r.text), `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
 }
 
 
